@@ -38,13 +38,13 @@ static inline struct fib_xid_lpm_local *fxid_llpm(struct fib_xid *fxid)
 		: NULL;
 }
 
-/* Use a tree FIB.
+/* Use a poptrie FIB.
  *
  * NOTE
- *      To fully change the tree FIB, you must change @lpm_all_rt_eops
- *	as well as the tree FIB calls in local_newroute().
+ *      To fully change the poptrie FIB, you must change @lpm_all_rt_eops
+ *	as well as the poptrie FIB calls in local_newroute().
  */
-const struct xia_ppal_rt_iops *lpm_rt_iops = &xia_ppal_tree_rt_iops;
+const struct xia_ppal_rt_iops *lpm_rt_iops = &xia_ppal_popt_rt_iops;
 
 /* Assuming the FIB is locked, find the appropriate anchor,
  * flush it, and unlock the FIB.
@@ -53,7 +53,7 @@ static void newroute_flush_anchor_locked(struct fib_xid_table *xtbl,
 					 struct fib_xid *new_fxid,
 					 struct xip_deferred_negdep_flush *dnf)
 {
-	struct fib_xid *pred_fxid = tree_fib_get_pred_locked(new_fxid);
+	struct fib_xid *pred_fxid = popt_fib_get_pred_locked(new_fxid);
 
 	if (!pred_fxid) {
 		lpm_rt_iops->fib_unlock(xtbl, NULL);
@@ -110,7 +110,7 @@ static int local_newroute(struct xip_ppal_ctx *ctx,
 	 * we can add an entry and find the appropriate predecessor
 	 * atomically to flush the appropriate anchor.
 	 */
-	rc = tree_fib_newroute_lock(&new_llpm->common, xtbl, cfg, NULL);
+	rc = popt_fib_newroute_lock(&new_llpm->common, xtbl, cfg, NULL);
 	if (rc) {
 		fib_free_dnf(dnf);
 		fxid_free_norcu(xtbl, &new_llpm->common);
@@ -207,7 +207,7 @@ static int main_newroute(struct xip_ppal_ctx *ctx, struct fib_xid_table *xtbl,
 	 * we can add an entry and find the appropriate predecessor
 	 * atomically to flush the appropriate anchor.
 	 */
-	rc = tree_fib_newroute_lock(&new_mrd->common, xtbl, cfg, NULL);
+	rc = popt_fib_newroute_lock(&new_mrd->common, xtbl, cfg, NULL);
 	if (rc) {
 		fib_free_dnf(dnf);
 		fxid_free_norcu(xtbl, &new_mrd->common);
@@ -222,15 +222,15 @@ static int main_newroute(struct xip_ppal_ctx *ctx, struct fib_xid_table *xtbl,
 static const xia_ppal_all_rt_eops_t lpm_all_rt_eops = {
 	[XRTABLE_LOCAL_INDEX] = {
 		.newroute = local_newroute,
-		.delroute = tree_fib_delroute,
+		.delroute = popt_fib_delroute,
 		.dump_fxid = local_dump_lpm,
 		.free_fxid = local_free_lpm,
 	},
 
 	[XRTABLE_MAIN_INDEX] = {
 		.newroute = main_newroute,
-		.delroute = tree_fib_delroute,
-		.dump_fxid = tree_fib_mrd_dump,
+		.delroute = popt_fib_delroute,
+		.dump_fxid = popt_fib_mrd_dump,
 		.free_fxid = fib_mrd_free,
 	},
 };

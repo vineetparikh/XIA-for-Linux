@@ -43,5 +43,30 @@ int tree_fib_mrd_dump(struct fib_xid *fxid, struct fib_xid_table *xtbl,
 	struct xip_ppal_ctx *ctx, struct sk_buff *skb,
 	struct netlink_callback *cb);
 
+/*
+ *	Exported by popt_fib.c
+ */
+
+extern const struct xia_ppal_rt_iops xia_ppal_popt_rt_iops;
+
+/* Find the first predecessor node above @fxid that also has an fxid.
+ *
+ * WARNING
+ *	This function will return the closest predecessor
+ *	regardless of the table it is in.
+ */
+struct fib_xid *popt_fib_get_pred_locked(struct fib_xid *fxid);
+
+int popt_fib_newroute_lock(struct fib_xid *new_fxid,
+	struct fib_xid_table *xtbl, struct xia_fib_config *cfg,
+	int *padded);
+
+int popt_fib_delroute(struct xip_ppal_ctx *ctx, struct fib_xid_table *xtbl,
+	struct xia_fib_config *cfg);
+
+int popt_fib_mrd_dump(struct fib_xid *fxid, struct fib_xid_table *xtbl,
+	struct xip_ppal_ctx *ctx, struct sk_buff *skb,
+	struct netlink_callback *cb);
+
 #endif /* __KERNEL__ */
 #endif /* _NET_XIA_LPM_H */
