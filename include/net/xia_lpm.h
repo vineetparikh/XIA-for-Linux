@@ -55,7 +55,8 @@ extern const struct xia_ppal_rt_iops xia_ppal_popt_rt_iops;
  *	This function will return the closest predecessor
  *	regardless of the table it is in.
  */
-struct fib_xid *popt_fib_get_pred_locked(struct fib_xid *fxid);
+struct fib_xid *popt_fib_get_pred_locked(struct fib_xid_table *xtbl,
+	struct fib_xid *fxid);
 
 int popt_fib_newroute_lock(struct fib_xid *new_fxid,
 	struct fib_xid_table *xtbl, struct xia_fib_config *cfg,

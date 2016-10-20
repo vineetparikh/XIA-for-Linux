@@ -65,11 +65,16 @@ struct radix_node6 {
     int mark;
 };
 
+struct fib_entry {
+    void *nexthop;
+    u32 refcnt;
+};
+
 /*
  * FIB mapping table
  */
 struct poptrie_fib {
-    void **entries;
+    struct fib_entry *entries;
     int n;
     int sz;
 };
@@ -147,8 +152,10 @@ extern "C" {
     int poptrie_route_change(struct poptrie *, u32, int, void *);
     int poptrie_route_update(struct poptrie *, u32, int, void *);
     int poptrie_route_del(struct poptrie *, u32, int);
+    void * poptrie_exact_lookup(struct poptrie *, u32, u8);
     void * poptrie_lookup(struct poptrie *, u32);
     void * poptrie_rib_lookup(struct poptrie *, u32);
+    void * poptrie_rib_lookup_prefix(struct poptrie *, u32, int);
 
     /* in poptrie6.c */
     struct poptrie6 * poptrie6_init(struct poptrie6 *, int, int);

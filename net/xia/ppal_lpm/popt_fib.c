@@ -8,6 +8,12 @@
 #define POPT_INIT_SZ1	19
 #define POPT_INIT_SZ0	22
 
+static inline u32 xid_to_u32(const u8 *xid)
+{
+	return (xid[0] * (1 << 24)) + (xid[1] * (1 << 16)) +
+		(xid[2] * (1 << 8)) + xid[3];
+}
+
 struct popt_fib_xid_table {
 	/* The poptrie data structure. */
 	struct poptrie	*poptrie;
@@ -94,20 +100,22 @@ static void popt_xtbl_death_work(struct work_struct *work)
 /* No extra information is needed, so @parg is empty. */
 static void popt_fib_unlock(struct fib_xid_table *xtbl, void *parg)
 {
-	write_unlock(&xtbl_pxtbl(xtbl)->writers_lock);
+	return;
 }
 
 static struct fib_xid *popt_fxid_find_rcu(struct fib_xid_table *xtbl,
 					  const u8 *xid)
 {
-	return NULL;
+	return (struct fib_xid *)poptrie_lookup(xtbl_pxtbl(xtbl)->poptrie,
+						xid_to_u32(xid));
 }
 
 /* No extra information is needed, so @parg is empty. */
 static struct fib_xid *popt_fxid_find_lock(void *parg,
 	struct fib_xid_table *xtbl, const u8 *xid)
 {
-	return NULL;
+	return (struct fib_xid *)poptrie_lookup(xtbl_pxtbl(xtbl)->poptrie,
+						xid_to_u32(xid));
 }
 
 static int popt_iterate_xids(struct fib_xid_table *xtbl,
@@ -116,31 +124,57 @@ static int popt_iterate_xids(struct fib_xid_table *xtbl,
 						    const void *arg),
 			     const void *arg)
 {
-	return 0;
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	struct poptrie *poptrie = pxtbl->poptrie;
+	int rc = 0;
+	int i;
+
+	for (i = 1 ; i < poptrie->fib.n; i++) {
+		if (poptrie->fib.entries[i].refcnt > 0) {
+			struct fib_xid *cur =
+				(struct fib_xid *)poptrie->
+					fib.entries[i].nexthop;
+			rc = locked_callback(xtbl, cur, arg);
+			if (rc)
+				goto out;
+		}
+	}
+
+out:
+	return rc;
 }
 
 /* No extra information is needed, so @parg is empty. */
 static int popt_fxid_add_locked(void *parg, struct fib_xid_table *xtbl,
 				struct fib_xid *fxid)
 {
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	int ret = poptrie_route_add(pxtbl->poptrie, xid_to_u32(fxid->fx_xid),
+				    fxid->fx_entry_type, (void *)fxid);
+	if (ret == 0)
+		atomic_inc(&xtbl->fxt_count);
 	return 0;
 }
 
 static int popt_fxid_add(struct fib_xid_table *xtbl, struct fib_xid *fxid)
 {
-	return 0;
+	return popt_fxid_add_locked(NULL, xtbl, fxid);
 }
 
 /* No extra information is needed, so @parg is empty. */
 static void popt_fxid_rm_locked(void *parg, struct fib_xid_table *xtbl,
 				struct fib_xid *fxid)
 {
-	return;
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	int ret = poptrie_route_del(pxtbl->poptrie, xid_to_u32(fxid->fx_xid),
+				    fxid->fx_entry_type);
+	if (ret == 0)
+		atomic_dec(&xtbl->fxt_count);
 }
 
 static void popt_fxid_rm(struct fib_xid_table *xtbl, struct fib_xid *fxid)
 {
-	return;
+	popt_fxid_rm_locked(NULL, xtbl, fxid);
 }
 
 /* popt_xid_rm() removes the entry with the longest matching prefix,
@@ -148,19 +182,61 @@ static void popt_fxid_rm(struct fib_xid_table *xtbl, struct fib_xid *fxid)
  */
 static struct fib_xid *popt_xid_rm(struct fib_xid_table *xtbl, const u8 *xid)
 {
-	return NULL;
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	struct fib_xid *fxid = (struct fib_xid *)poptrie_lookup(pxtbl->poptrie,
+		xid_to_u32(xid));
+	if (!fxid)
+		return NULL;
+	popt_fxid_rm_locked(NULL, xtbl, fxid);
+	return fxid;
 }
 
 static void popt_fxid_replace_locked(struct fib_xid_table *xtbl,
 				     struct fib_xid *old_fxid,
 				     struct fib_xid *new_fxid)
 {
-	return;
+	/* XXX This can fail. Should the API for replace be changed? */
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	poptrie_route_change(pxtbl->poptrie, xid_to_u32(old_fxid->fx_xid),
+			     old_fxid->fx_entry_type, (void *)new_fxid);
 }
 
 int popt_fib_newroute_lock(struct fib_xid *new_fxid, struct fib_xid_table *xtbl,
 			   struct xia_fib_config *cfg, int *padded)
 {
+	struct fib_xid *cur_fxid;
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	
+	const u8 *id;
+
+	if (padded)
+		*padded = 0;
+
+	/* Acquire lock and do exact matching to find @cur_fxid. */
+	id = cfg->xfc_dst->xid_id;
+	cur_fxid = poptrie_exact_lookup(pxtbl->poptrie, xid_to_u32(id),
+					new_fxid->fx_entry_type);
+	if (cur_fxid) {
+		if ((cfg->xfc_nlflags & NLM_F_EXCL) ||
+		    !(cfg->xfc_nlflags & NLM_F_REPLACE))
+			return -EEXIST;
+
+		if (cur_fxid->fx_table_id != new_fxid->fx_table_id)
+			return -EINVAL;
+
+		popt_fxid_replace_locked(xtbl, cur_fxid, new_fxid);
+		fxid_free(xtbl, cur_fxid);
+		return 0;
+	}
+
+	if (!(cfg->xfc_nlflags & NLM_F_CREATE))
+		return -ENOENT;
+
+	/* Add new entry. */
+	BUG_ON(popt_fxid_add_locked(NULL, xtbl, new_fxid));
+
+	if (padded)
+		*padded = 1;
 	return 0;
 }
 
@@ -168,7 +244,7 @@ static int popt_fib_newroute(struct fib_xid *new_fxid,
 			     struct fib_xid_table *xtbl,
 			     struct xia_fib_config *cfg, int *padded)
 {
-	return 0;
+	return popt_fib_newroute_lock(new_fxid, xtbl, cfg, padded);
 }
 
 /* popt_fib_delroute() differs from all_fib_delroute() because its lookup
@@ -178,7 +254,34 @@ static int popt_fib_newroute(struct fib_xid *new_fxid,
 int popt_fib_delroute(struct xip_ppal_ctx *ctx, struct fib_xid_table *xtbl,
 		      struct xia_fib_config *cfg)
 {
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	struct fib_xid *fxid;
+	int rc;
+	const u8 *id;
+	if (!valid_prefix(cfg))
+		return -EINVAL;
+
+	/* Do exact matching to find @fxid. */
+	id = cfg->xfc_dst->xid_id;
+	fxid = (struct fib_xid *)poptrie_exact_lookup(pxtbl->poptrie,
+		xid_to_u32(id), *(u8 *)cfg->xfc_protoinfo);
+	if (!fxid) {
+		rc = -ENOENT;
+		goto unlock;
+	}
+	if (fxid->fx_table_id != cfg->xfc_table) {
+		rc = -EINVAL;
+		goto unlock;
+	}
+	
+	popt_fxid_rm_locked(NULL, xtbl, fxid);
+	popt_fib_unlock(xtbl, NULL);
+	fxid_free(xtbl, fxid);
 	return 0;
+
+unlock:
+	popt_fib_unlock(xtbl, NULL);
+	return rc;
 }
 
 /* Dump all entries in the poptrie. */
@@ -186,12 +289,31 @@ static int popt_xtbl_dump_rcu(struct fib_xid_table *xtbl,
 			      struct xip_ppal_ctx *ctx, struct sk_buff *skb,
 			      struct netlink_callback *cb)
 {
-	return 0;
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	int rc = 0;
+	int i;
+	for (i = 1; i < pxtbl->poptrie->fib.n; i++) {
+		if (pxtbl->poptrie->fib.entries[i].refcnt > 0) {
+			struct fib_xid *fxid =
+				(struct fib_xid *)pxtbl->poptrie->
+					fib.entries[i].nexthop;
+			rc = xtbl->all_eops[fxid->fx_table_id].
+					dump_fxid(fxid, xtbl, ctx, skb, cb);
+			if (rc < 0)
+				goto out;
+		}
+	}
+out:
+	return rc;
 }
 
-struct fib_xid *popt_fib_get_pred_locked(struct fib_xid *fxid)
+struct fib_xid *popt_fib_get_pred_locked(struct fib_xid_table *xtbl,
+	struct fib_xid *fxid)
 {
-	return NULL;
+	struct popt_fib_xid_table *pxtbl = xtbl_pxtbl(xtbl);
+	return poptrie_rib_lookup_prefix(pxtbl->poptrie,
+					 xid_to_u32(fxid->fx_xid),
+					 fxid->fx_entry_type - 1);
 }
 
 /* Main entries for LPM need to display the prefix length when dumped,
@@ -201,7 +323,50 @@ int popt_fib_mrd_dump(struct fib_xid *fxid, struct fib_xid_table *xtbl,
 		      struct xip_ppal_ctx *ctx, struct sk_buff *skb,
 		      struct netlink_callback *cb)
 {
+	struct nlmsghdr *nlh;
+	u32 portid = NETLINK_CB(cb->skb).portid;
+	u32 seq = cb->nlh->nlmsg_seq;
+	struct rtmsg *rtm;
+	struct fib_xid_redirect_main *mrd = fxid_mrd(fxid);
+	struct xia_xid dst;
+
+	nlh = nlmsg_put(skb, portid, seq, RTM_NEWROUTE, sizeof(*rtm),
+			NLM_F_MULTI);
+	if (nlh == NULL)
+		return -EMSGSIZE;
+
+	rtm = nlmsg_data(nlh);
+	rtm->rtm_family = AF_XIA;
+	rtm->rtm_dst_len = sizeof(struct xia_xid);
+	rtm->rtm_src_len = 0;
+	rtm->rtm_tos = 0; /* XIA doesn't have a tos. */
+	rtm->rtm_table = XRTABLE_MAIN_INDEX;
+	/* XXX One may want to vary here. */
+	rtm->rtm_protocol = RTPROT_UNSPEC;
+	/* XXX One may want to vary here. */
+	rtm->rtm_scope = RT_SCOPE_UNIVERSE;
+	rtm->rtm_type = RTN_UNICAST;
+	/* XXX One may want to put something here, like RTM_F_CLONED. */
+	rtm->rtm_flags = 0;
+
+	dst.xid_type = xtbl_ppalty(xtbl);
+	memmove(dst.xid_id, fxid->fx_xid, XIA_XID_MAX);
+
+	if (unlikely(nla_put(skb, RTA_DST, sizeof(dst), &dst) ||
+		     nla_put(skb, RTA_GATEWAY, sizeof(mrd->gw), &mrd->gw)))
+		goto nla_put_failure;
+
+	/* Add prefix length to packet. */
+	if (unlikely(nla_put(skb, RTA_PROTOINFO, sizeof(fxid->fx_entry_type),
+			     &(fxid->fx_entry_type))))
+		goto nla_put_failure;
+
+	nlmsg_end(skb, nlh);
 	return 0;
+
+nla_put_failure:
+	nlmsg_cancel(skb, nlh);
+	return -EMSGSIZE;	
 }
 
 const struct xia_ppal_rt_iops xia_ppal_popt_rt_iops = {

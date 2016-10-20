@@ -5,6 +5,7 @@
 
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <net/xia_fib.h>
 
 #include "buddy.h"
 #include "poptrie.h"
@@ -74,12 +75,12 @@ _route_update(struct poptrie *, struct radix_node **, u32, int, poptrie_leaf_t,
               int, struct radix_node *);
 static int
 _route_del(struct poptrie *, struct radix_node **, u32, int, int,
-           struct radix_node *);
+           struct radix_node *, u16 *);
 static int
 _route_del_propagate(struct radix_node *, struct radix_node *,
                      struct radix_node *);
-static u32 _rib_lookup(struct radix_node *, u32, int, struct radix_node *);
 static void _release_radix(struct radix_node *);
+static u32 _rib_lookup(struct radix_node *, u32, int, struct radix_node *);
 
 /*
  * Bit scan
@@ -180,7 +181,7 @@ poptrie_init(struct poptrie *poptrie, int sz1, int sz0)
     }
 
     /* Prepare the FIB mapping table */
-    poptrie->fib.entries = kmalloc(sizeof(void *) * POPTRIE_INIT_FIB_SIZE,
+    poptrie->fib.entries = kmalloc(sizeof(*poptrie->fib.entries) * POPTRIE_INIT_FIB_SIZE,
 	GFP_KERNEL);
     if ( NULL == poptrie->fib.entries ) {
         poptrie_release(poptrie);
@@ -189,7 +190,9 @@ poptrie_init(struct poptrie *poptrie, int sz1, int sz0)
     poptrie->fib.sz = POPTRIE_INIT_FIB_SIZE;
     poptrie->fib.n = 0;
     /* Insert a NULL entry */
-    poptrie->fib.entries[poptrie->fib.n++] = NULL;
+    poptrie->fib.entries[poptrie->fib.n].nexthop = NULL;
+    poptrie->fib.entries[poptrie->fib.n].refcnt = 0;
+    poptrie->fib.n++;
 
     return poptrie;
 }
@@ -243,7 +246,7 @@ poptrie_route_add(struct poptrie *poptrie, u32 prefix, int len, void *nexthop)
 
     /* Find the FIB entry mapping first */
     for ( i = 0; i < poptrie->fib.n; i++ ) {
-        if ( poptrie->fib.entries[i] == nexthop ) {
+        if ( poptrie->fib.entries[i].nexthop == nexthop ) {
             /* Found the matched entry */
             n = i;
             break;
@@ -257,7 +260,8 @@ poptrie_route_add(struct poptrie *poptrie, u32 prefix, int len, void *nexthop)
         }
         /* Append new FIB entry */
         n = poptrie->fib.n;
-        poptrie->fib.entries[n] = nexthop;
+        poptrie->fib.entries[n].nexthop = nexthop;
+        poptrie->fib.entries[n].refcnt = 0;
         poptrie->fib.n++;
     }
 
@@ -268,6 +272,7 @@ poptrie_route_add(struct poptrie *poptrie, u32 prefix, int len, void *nexthop)
         return ret;
     }
 
+    poptrie->fib.entries[i].refcnt++;
     return 0;
 }
 
@@ -280,20 +285,28 @@ poptrie_route_change(struct poptrie *poptrie, u32 prefix, int len,
 {
     int i;
     int n = 0;
+    int ret;
 
     for ( i = 0; i < poptrie->fib.n; i++ ) {
-        if ( poptrie->fib.entries[i] == nexthop ) {
+        if ( poptrie->fib.entries[i].nexthop == nexthop ) {
             n = i;
             break;
         }
     }
     if ( i == poptrie->fib.n ) {
         n = poptrie->fib.n;
-        poptrie->fib.entries[n] = nexthop;
+        poptrie->fib.entries[n].nexthop = nexthop;
+        poptrie->fib.entries[n].refcnt = 0;
         poptrie->fib.n++;
     }
 
-    return _route_change(poptrie, &poptrie->radix, prefix, len, n, 0);
+    ret = _route_change(poptrie, &poptrie->radix, prefix, len, n, 0);
+    if ( ret < 0 ) {
+        return ret;
+    }
+
+    poptrie->fib.entries[i].refcnt++;
+    return 0;
 }
 
 /*
@@ -308,14 +321,15 @@ poptrie_route_update(struct poptrie *poptrie, u32 prefix, int len,
     int n = 0;
 
     for ( i = 0; i < poptrie->fib.n; i++ ) {
-        if ( poptrie->fib.entries[i] == nexthop ) {
+        if ( poptrie->fib.entries[i].nexthop == nexthop ) {
             n = i;
             break;
         }
     }
     if ( i == poptrie->fib.n ) {
         n = poptrie->fib.n;
-        poptrie->fib.entries[n] = nexthop;
+        poptrie->fib.entries[n].nexthop = nexthop;
+        poptrie->fib.entries[n].refcnt = 0;
         poptrie->fib.n++;
     }
 
@@ -325,6 +339,7 @@ poptrie_route_update(struct poptrie *poptrie, u32 prefix, int len,
         return ret;
     }
 
+    poptrie->fib.entries[n].refcnt++;
     return 0;
 }
 
@@ -335,7 +350,39 @@ int
 poptrie_route_del(struct poptrie *poptrie, u32 prefix, int len)
 {
     /* Search and delete the corresponding entry */
-    return _route_del(poptrie, &poptrie->radix, prefix, len, 0, NULL);
+    u16 idx;
+    int ret;
+
+    ret = _route_del(poptrie, &poptrie->radix, prefix, len, 0, NULL, &idx);
+    if ( ret < 0 ) {
+        return ret;
+    }
+
+    poptrie->fib.entries[idx].refcnt--;
+    return 0;
+}
+
+static inline u32 xid_to_u32(const u8 *xid)
+{
+	return (xid[0] * (1 << 24)) + (xid[1] * (1 << 16)) +
+		(xid[2] * (1 << 8)) + xid[3];
+}
+
+void *
+poptrie_exact_lookup(struct poptrie *poptrie, u32 addr, u8 prefix_len)
+{
+	int i;
+	for (i = 1; i < poptrie->fib.n; i++) {
+		if (poptrie->fib.entries[i].refcnt > 0) {
+			struct fib_xid *fxid =
+				(struct fib_xid *)poptrie->fib.
+				entries[i].nexthop;
+			if (fxid->fx_entry_type == prefix_len &&
+			    xid_to_u32(fxid->fx_xid) == addr)
+				return fxid;
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -356,7 +403,8 @@ poptrie_lookup(struct poptrie *poptrie, u32 addr)
 
     /* Direct pointing */
     if ( poptrie->dir[idx] & ((u32)1 << 31) ) {
-        return poptrie->fib.entries[poptrie->dir[idx] & (((u32)1 << 31) - 1)];
+        return poptrie->fib.
+            entries[poptrie->dir[idx] & (((u32)1 << 31) - 1)].nexthop;
     } else {
         base = poptrie->dir[idx];
         idx = INDEX(addr, pos, 6);
@@ -378,7 +426,8 @@ poptrie_lookup(struct poptrie *poptrie, u32 addr)
             /* Leaf */
             base = poptrie->nodes[inode].base0;
             idx = POPCNT_LS(poptrie->nodes[inode].leafvec, idx);
-            return poptrie->fib.entries[poptrie->leaves[base + idx - 1]];
+            return poptrie->fib.
+                entries[poptrie->leaves[base + idx - 1]].nexthop;
         }
     }
 
@@ -392,7 +441,8 @@ poptrie_lookup(struct poptrie *poptrie, u32 addr)
 void *
 poptrie_rib_lookup(struct poptrie *poptrie, u32 addr)
 {
-    return poptrie->fib.entries[_rib_lookup(poptrie->radix, addr, 0, NULL)];
+    return poptrie->fib.
+        entries[_rib_lookup(poptrie->radix, addr, 0, NULL)].nexthop;
 }
 
 /*
@@ -1869,7 +1919,7 @@ _route_update(struct poptrie *poptrie, struct radix_node **node, u32 prefix,
  */
 static int
 _route_del(struct poptrie *poptrie, struct radix_node **node, u32 prefix,
-           int len, int depth, struct radix_node *ext)
+           int len, int depth, struct radix_node *ext, u16 *idx)
 {
     int ret;
 
@@ -1888,6 +1938,7 @@ _route_del(struct poptrie *poptrie, struct radix_node **node, u32 prefix,
 
         /* Invalidate the node */
         (*node)->valid = 0;
+        *idx = (*node)->nexthop;
         (*node)->nexthop = 0;
 
         /* Marked root */
@@ -1910,11 +1961,11 @@ _route_del(struct poptrie *poptrie, struct radix_node **node, u32 prefix,
         if ( (prefix >> (32 - depth - 1)) & 1 ) {
             /* Right */
             ret = _route_del(poptrie, &((*node)->right), prefix, len, depth + 1,
-                             ext);
+                             ext, idx);
         } else {
             /* Left */
             ret = _route_del(poptrie, &((*node)->left), prefix, len, depth + 1,
-                             ext);
+                             ext, idx);
         }
         if ( ret < 0 ) {
             return ret;
@@ -1955,6 +2006,54 @@ _route_del_propagate(struct radix_node *node, struct radix_node *oext,
 /*
  * Lookup from the RIB table
  */
+static u32
+_rib_lookup_prefix(struct radix_node *node, u32 addr, int depth,
+		   int height, struct radix_node *en)
+{
+    if ( NULL == node ) {
+        return 0;
+    }
+    if ( node->valid ) {
+        en = node;
+    }
+    if (depth == height) {
+        if (!en)
+            return 0;
+        return en->nexthop;
+    }
+
+    if ( (addr >> (32 - depth - 1)) & 1 ) {
+        /* Right */
+        if ( NULL == node->right ) {
+            if ( NULL != en ) {
+                return en->nexthop;
+            } else {
+                return 0;
+            }
+        } else {
+            return _rib_lookup_prefix(node->right, addr, depth + 1, height, en);
+        }
+    } else {
+        /* Left */
+        if ( NULL == node->left ) {
+            if ( NULL != en ) {
+                return en->nexthop;
+            } else {
+                return 0;
+            }
+        } else {
+            return _rib_lookup_prefix(node->left, addr, depth + 1, height, en);
+        }
+    }
+}
+
+void *
+poptrie_rib_lookup_prefix(struct poptrie *poptrie, u32 addr, int height)
+{
+    return poptrie->fib.entries[
+	_rib_lookup_prefix(poptrie->radix, addr, 0, height, NULL)].nexthop;
+}
+
 static u32
 _rib_lookup(struct radix_node *node, u32 addr, int depth, struct radix_node *en)
 {
