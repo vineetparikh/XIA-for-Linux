@@ -35,6 +35,67 @@ static inline struct popt_fib_xid_table *xtbl_pxtbl(struct fib_xid_table *xtbl)
 
 static void popt_xtbl_death_work(struct work_struct *work);
 
+static void test_popt_fib(struct poptrie *poptrie)
+{
+	const char *entries[20] = {
+		"31.132.3.0/24 195.66.225.162",
+		"31.132.4.0/22 195.66.225.162",
+		"31.132.64.0/21 195.66.225.86",
+		"31.132.72.0/21 195.66.225.86",
+		"31.132.80.0/21 195.66.225.86",
+		"31.132.88.0/21 195.66.225.86",
+		"31.132.96.0/19 195.66.225.86",
+		"31.132.128.0/18 195.66.225.86",
+		"31.132.192.0/24 195.66.225.86",
+		"31.132.193.0/8 195.66.225.86",
+		"31.132.194.0/24 195.66.225.86",
+		"31.132.197.0/24 195.66.225.86",
+		"31.132.198.0/8 195.66.225.86",
+		"31.132.199.0/12 195.66.225.86",
+		"31.132.200.0/21 195.66.225.86",
+		"31.132.208.0/20 195.66.225.86",
+		"31.132.224.0/20 195.66.225.86",
+		"31.132.240.0/21 195.66.225.86",
+		"31.132.248.0/21 195.66.225.86",
+		"31.133.0.0/21 195.66.225.86",
+	};
+
+	int i;
+	for (i = 0; i < 20; i++) {
+		int prefix[4];
+		int prefixlen;
+		int nexthop[4];
+		u32 addr1;
+		u32 addr2;
+
+		int ret = sscanf(entries[i], "%d.%d.%d.%d/%d %d.%d.%d.%d",
+			&prefix[0], &prefix[1], &prefix[2], &prefix[3],
+			&prefixlen,
+			&nexthop[0], &nexthop[1], &nexthop[2], &nexthop[3]);
+		if (ret < 0) {
+			return;
+		}
+
+		addr1 = ((u32)prefix[0] << 24) + ((u32)prefix[1] << 16)
+			+ ((u32)prefix[2] << 8) + (u32)prefix[3];
+		addr2 = ((u32)nexthop[0] << 24) + ((u32)nexthop[1] << 16)
+			+ ((u32)nexthop[2] << 8) + (u32)nexthop[3];
+
+		ret = poptrie_route_add(poptrie, addr1, prefixlen,
+			(void *)(u64)addr2);
+		if (ret < 0) {
+			return;
+		}
+	}
+
+	for (i = 528745200; i < 529000000; i++) {
+		if (poptrie_lookup(poptrie, i) !=
+			poptrie_rib_lookup(poptrie, i)) {
+			printk(KERN_ALERT "Lookup on %d failed\n", i);
+		}
+	}
+}
+
 static int popt_xtbl_init(struct xip_ppal_ctx *ctx, struct net *net,
 			  struct xia_lock_table *locktbl,
 			  const xia_ppal_all_rt_eops_t all_eops,
@@ -66,6 +127,8 @@ static int popt_xtbl_init(struct xip_ppal_ctx *ctx, struct net *net,
 	atomic_set(&new_xtbl->refcnt, 1);
 	INIT_WORK(&new_xtbl->fxt_death_work, popt_xtbl_death_work);
 	ctx->xpc_xtbl = new_xtbl;
+
+	test_popt_fib(pxtbl->poptrie);
 
 	return 0;
 }
